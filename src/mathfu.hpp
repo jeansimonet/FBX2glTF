@@ -101,3 +101,41 @@ inline Mat4f toMat4f(const FbxAMatrix& m) {
 inline Quatf toQuatf(const FbxQuaternion& q) {
   return Quatf((float)q[3], (float)q[0], (float)q[1], (float)q[2]);
 }
+
+inline FbxDouble3 toFbxDouble3(const Vec3f& v) {
+  return FbxDouble3(v[0], v[1], v[2]);
+}
+
+inline FbxVector2 toFbxVector2(const Vec2f& v) {
+  return FbxVector2(v[0], v[1]);
+}
+
+inline FbxVector4 toFbxVector4Vector(const Vec3f& v) {
+  return FbxVector4(v[0], v[1], v[2], 0);
+}
+
+inline FbxVector4 toFbxVector4Position(const Vec3f& v) {
+  return FbxVector4(v[0], v[1], v[2], 1);
+}
+
+inline FbxVector4 toFbxVector4(const Vec4f& v) {
+  return FbxVector4(v[0], v[1], v[2], v[3]);
+}
+
+inline FbxColor toFbxColor(const Vec4f& v) {
+  return FbxColor(v[0], v[1], v[2], v[3]);
+}
+
+inline FbxQuaternion toFbxQuaternion(const Quatf& q) {
+  return FbxQuaternion(q[1], q[2], q[3], q[0]);
+}
+
+inline FbxAMatrix toFbxAMatrix(const Mat4f& m) {
+  auto result = FbxAMatrix();
+  for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < 4; col++) {
+      result[row][col] = m(row, col);
+    }
+  }
+  return result;
+}
