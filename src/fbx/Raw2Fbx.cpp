@@ -30,10 +30,11 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
       fbxNode->SetTransformationInheritType(FbxTransform::eInheritRSrs);
 
       // Set the node local transform
-      fbxNode->LclTranslation.Set(toFbxDouble3(node.translation));
-      auto fbxEuler = toFbxQuaternion(node.rotation).DecomposeSphericalXYZ();
-      fbxNode->LclRotation.Set(fbxEuler);
-      fbxNode->LclScaling.Set(toFbxVector4Position(node.scale));
+      FbxAMatrix mat;
+      mat.SetTQS(toFbxDouble3(node.translation), toFbxQuaternion(node.rotation), toFbxVector4Position(node.scale));
+      fbxNode->LclTranslation.Set(mat.GetT());
+      fbxNode->LclRotation.Set(mat.GetR());
+      fbxNode->LclScaling.Set(mat.GetS());
   }
 
   // Set all the parent links
@@ -246,18 +247,19 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
       }
 
       FbxSkeleton* pSkeletonRootAttribute = FbxSkeleton::Create(pScene, rawSkeletonRootNode.name.c_str());
-      pSkeletonRootAttribute->SetSkeletonType(FbxSkeleton::eRoot);
+      pSkeletonRootAttribute->SetSkeletonType(FbxSkeleton::eLimb);
       FbxNode* pSkeletonRoot = idToFbxNodeMap[surface.skeletonRootId];
       pSkeletonRoot->SetNodeAttribute(pSkeletonRootAttribute);
 
       // Now iterate through the children and children of children
+      //
 
       // Define a lambda to do the work of adding a skeleton attribute to a bone node and
       // recursing through the hierarchy of bones
       std::function<void(int)> attachSkeletonAttribute = [&] (int skeletonNodeId) {
         auto& rawSkeletonNode = raw.GetNode(raw.GetNodeById(skeletonNodeId));
         if (!rawSkeletonNode.isJoint) {
-          fmt::printf("Error:: Child node of skeleton root isn't a joint.\n");
+          // Skip non-joints in the joint chain.
           return;
         }
 
@@ -265,11 +267,7 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
         FbxSkeleton* pSkeletonNodeAttribute = FbxSkeleton::Create(pScene, rawSkeletonNode.name.c_str());
         // SDK seems to indicate that the type should be eEffector for the last node in a tree, but
         // the examples don't follow that, so not sure if it is really necessary
-        FbxSkeleton::EType skelType = FbxSkeleton::eLimb;
-        if (rawSkeletonNode.childIds.empty()) {
-          skelType = FbxSkeleton::eEffector;
-        }
-        pSkeletonNodeAttribute->SetSkeletonType(skelType); 
+        pSkeletonNodeAttribute->SetSkeletonType(FbxSkeleton::eLimb); 
         FbxNode* pSkeletonNode = idToFbxNodeMap[skeletonNodeId];
         pSkeletonNode->SetNodeAttribute(pSkeletonNodeAttribute);
 
@@ -333,6 +331,7 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
 
       // Add the skin to the mesh, and the clusters to the skin!
       FbxSkin* pSkin = FbxSkin::Create(pScene, surface.name.c_str());
+      pSkin->SetSkinningType(FbxSkin::eBlend);
 
       for (auto idAndCluster : rawBoneNodeIdToClusterMap) {
         pSkin->AddCluster(idAndCluster.second);
@@ -359,6 +358,101 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
 
       // Connect!!
       fbxNode->SetNodeAttribute(fbxMesh);
+    }
+  }
+
+  // Animations
+  for (int i = 0; i < raw.GetAnimationCount(); ++i) {
+    // Get raw animation
+    auto& rawAnim = raw.GetAnimation(i);
+    
+    // Create an anim stack in the fbx
+    FbxAnimStack* pAnimStack = FbxAnimStack::Create(pScene, rawAnim.name.c_str());
+
+    // Set the time range
+    pAnimStack->LocalStart = rawAnim.times.front();
+    pAnimStack->LocalStop = rawAnim.times.back();
+
+    // Create one (and only) layer
+    FbxAnimLayer* pAnimLayer = FbxAnimLayer::Create(pScene, "Base Layer");
+    pAnimStack->AddMember(pAnimLayer);
+
+    // Add a curve for each node and each property of the initial anim
+    for (int c = 0; c < rawAnim.channels.size(); ++c) {
+      auto& rawChannel = rawAnim.channels[c];
+
+      // Grab the fbx bone this channel points to
+      auto& rawNode = raw.GetNode(rawChannel.nodeIndex);
+      FbxNode* pFbxNode = idToFbxNodeMap[rawNode.id];
+
+      // TODO: Need to animate blend shapes weight...
+
+      // Now add data to those!
+      FbxTime keyTime;
+      FbxAnimCurveKey key;
+
+      // First the translations
+      if (!rawChannel.translations.empty()) {
+        // Tell the SDK to create the compound XYZ curve, we'll retrieve individual x y and z later.
+        pFbxNode->LclTranslation.GetCurveNode(pAnimLayer, true);
+        auto addTranslationCurve = [&] (int component, const char* channelId) {
+          FbxAnimCurve* pCurve = pFbxNode->LclTranslation.GetCurve(pAnimLayer, channelId, true);
+          pCurve->KeyModifyBegin();
+          for (int t = 0; t < rawAnim.times.size(); ++t) {
+            keyTime.SetSecondDouble(rawAnim.times[t]);
+            key.Set(keyTime, toFbxDouble3(rawChannel.translations[t])[component]);
+            pCurve->KeyAdd(keyTime, key);
+          }
+          pCurve->KeyModifyEnd();
+        };
+        addTranslationCurve(0, FBXSDK_CURVENODE_COMPONENT_X);
+        addTranslationCurve(1, FBXSDK_CURVENODE_COMPONENT_Y);
+        addTranslationCurve(2, FBXSDK_CURVENODE_COMPONENT_Z);
+      }
+
+      // Then rotations
+      if (!rawChannel.rotations.empty()) {
+        // Tell the SDK to create the compound XYZ curve, we'll retrieve individual x y and z later.
+        pFbxNode->LclRotation.GetCurveNode(pAnimLayer, true);
+        auto addRotationCurve = [&] (int component, const char* channelId) {
+          FbxAnimCurve* pCurve = pFbxNode->LclRotation.GetCurve(pAnimLayer, channelId, true);
+          pCurve->KeyModifyBegin();
+          for (int t = 0; t < rawAnim.times.size(); ++t) {
+            keyTime.SetSecondDouble(rawAnim.times[t]);
+
+            // So ugly...
+            FbxAMatrix helpMeFixThisRoitationPlease;
+            helpMeFixThisRoitationPlease.SetTQS(FbxDouble3(0,0,0), toFbxQuaternion(rawChannel.rotations[t]), FbxVector4(1,1,1,1));
+            key.Set(keyTime, helpMeFixThisRoitationPlease.GetR()[component]);
+            pCurve->KeyAdd(keyTime, key);
+          }
+          pCurve->KeyModifyEnd();
+        };
+        addRotationCurve(0, FBXSDK_CURVENODE_COMPONENT_X);
+        addRotationCurve(1, FBXSDK_CURVENODE_COMPONENT_Y);
+        addRotationCurve(2, FBXSDK_CURVENODE_COMPONENT_Z);
+      }
+
+      // Finally Scaling
+      if (!rawChannel.scales.empty()) {
+        // Tell the SDK to create the compound XYZ curve, we'll retrieve individual x y and z later.
+        pFbxNode->LclScaling.GetCurveNode(pAnimLayer, true);
+        auto addScalingCurve = [&] (int component, const char* channelId) {
+          FbxAnimCurve* pCurve = pFbxNode->LclScaling.GetCurve(pAnimLayer, channelId, true);
+          pCurve->KeyModifyBegin();
+          for (int t = 0; t < rawAnim.times.size(); ++t) {
+            keyTime.SetSecondDouble(rawAnim.times[t]);
+            key.Set(keyTime, toFbxVector4Position(rawChannel.scales[t])[component]);
+            pCurve->KeyAdd(keyTime, key);
+          }
+          pCurve->KeyModifyEnd();
+        };
+        addScalingCurve(0, FBXSDK_CURVENODE_COMPONENT_X);
+        addScalingCurve(1, FBXSDK_CURVENODE_COMPONENT_Y);
+        addScalingCurve(2, FBXSDK_CURVENODE_COMPONENT_Z);
+      }
+
+      // TODO: Weights...
     }
   }
 
