@@ -181,9 +181,6 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
       lGeometryElementUV1->SetReferenceMode(FbxGeometryElement::eDirect);
     }
 
-    // RAW_VERTEX_ATTRIBUTE_JOINT_INDICES = 1 << 7,
-    // RAW_VERTEX_ATTRIBUTE_JOINT_WEIGHTS = 1 << 8,
-
     for (int v = 0; v < surfaceVertIndices.size(); ++v) {
       auto& vert = raw.GetVertex(surfaceVertIndices[v]);
 
@@ -337,6 +334,63 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
         pSkin->AddCluster(idAndCluster.second);
       }
       fbxMesh->AddDeformer(pSkin);
+    }
+
+
+    // Blend channels. This is kind of like skinning data, in that FBX works
+    // the opposite way that RAW does. Raw stores the blends in each vertex,
+    // while the FBX stores a modifier with a duplicate shape (i.e mesh) for
+    // each channel.
+    for (int c = 0; c < surface.blendChannels.size(); ++c) {
+      // For each channel, we need to create a new shape and control points
+      auto& channel = surface.blendChannels[c];
+
+      // Creathe shape etc...
+      FbxShape* pShape = FbxShape::Create(pScene, channel.name.c_str());
+      pShape->InitControlPoints(surfaceVertIndices.size());
+
+      // Add geometry elements based on the vertex attributes
+      FbxVector4* controlPoints = nullptr;
+      if (attributes & RAW_VERTEX_ATTRIBUTE_POSITION) {
+        controlPoints = pShape->GetControlPoints();
+      }
+
+      FbxGeometryElementNormal* lGeometryElementNormal = nullptr;
+      if (attributes & RAW_VERTEX_ATTRIBUTE_NORMAL) {
+        lGeometryElementNormal = pShape->CreateElementNormal();
+        lGeometryElementNormal->SetMappingMode(FbxGeometryElement::eByControlPoint);
+        lGeometryElementNormal->SetReferenceMode(FbxGeometryElement::eDirect);
+      }
+
+      FbxGeometryElementTangent* lGeometryElementTangent = nullptr;
+      if (attributes & RAW_VERTEX_ATTRIBUTE_TANGENT) {
+        lGeometryElementTangent = pShape->CreateElementTangent();
+        lGeometryElementTangent->SetMappingMode(FbxGeometryElement::eByControlPoint);
+        lGeometryElementTangent->SetReferenceMode(FbxGeometryElement::eDirect);
+      }
+
+      for (int v = 0; v < surfaceVertIndices.size(); ++v) {
+        auto& vert = raw.GetVertex(surfaceVertIndices[v]);
+
+        if (attributes & RAW_VERTEX_ATTRIBUTE_POSITION) {
+          controlPoints[v] = toFbxVector4Position(vert.blends[c].position + vert.position);
+        }
+
+        if (attributes & RAW_VERTEX_ATTRIBUTE_NORMAL) {
+          lGeometryElementNormal->GetDirectArray().Add(toFbxVector4Vector(vert.blends[c].normal + vert.normal));
+        }
+
+        if (attributes & RAW_VERTEX_ATTRIBUTE_TANGENT) {
+          lGeometryElementTangent->GetDirectArray().Add(toFbxVector4(vert.blends[c].tangent + vert.tangent));
+        }
+      }
+
+      // Now associate this shape with a channel
+      FbxBlendShape* pBlendShape = FbxBlendShape::Create(pScene, channel.name.c_str());
+      FbxBlendShapeChannel* pBlendShapeChannel = FbxBlendShapeChannel::Create(pScene, channel.name.c_str());
+      fbxMesh->AddDeformer(pBlendShape);
+      pBlendShape->AddBlendShapeChannel(pBlendShapeChannel);
+      pBlendShapeChannel->AddTargetShape(pShape);
     }
   }
 
