@@ -8,6 +8,7 @@
  */
 
 #include "Raw2Fbx.hpp"
+#include <unordered_set>
 
 static double scaleFactor = 100.0; // Technically we compute it in Raw2Fbx, but it will also come out to 100 :)
 
@@ -84,10 +85,135 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
   //   objectProperty = pNode->GetNextProperty(objectProperty);
   // }
 
+  // Textures
+  std::vector<FbxFileTexture*> fbxTextures;
+  for (int i = 0; i < raw.GetTextureCount(); ++i) {
+    auto& rawTexture = raw.GetTexture(i);
+    FbxFileTexture* pTexture = FbxFileTexture::Create(pScene, rawTexture.name.c_str());
+    pTexture->SetFileName(rawTexture.fileLocation.c_str());
+
+    // Set the type of texture
+    switch (rawTexture.usage) {
+      case RAW_TEXTURE_USAGE_NORMAL:
+        pTexture->SetTextureUse(FbxTexture::eBumpNormalMap);
+        break;
+      case RAW_TEXTURE_USAGE_REFLECTION:
+        pTexture->SetTextureUse(FbxTexture::eSphericalReflectionMap);
+        break;
+      default:
+        pTexture->SetTextureUse(FbxTexture::eStandard);
+        break;
+    }
+
+    pTexture->SetMappingType(FbxTexture::eUV);
+    pTexture->SetMaterialUse(FbxFileTexture::eModelMaterial);
+
+    fbxTextures.push_back(pTexture);
+  }
+
+  // Materials
+  std::vector<FbxSurfaceMaterial*> fbxSurfaceMaterials;
+  for (int i = 0; i < raw.GetMaterialCount(); ++i) {
+    auto& rawMaterial = raw.GetMaterial(i);
+    
+    // Create the proper surface type
+    FbxSurfaceMaterial* pFbxSurf = nullptr;
+    switch (rawMaterial.info->shadingModel) {
+      case RAW_SHADING_MODEL_CONSTANT:
+        // TODO
+        break;
+      case RAW_SHADING_MODEL_LAMBERT:
+        {
+          // Create the surface
+          FbxSurfaceLambert* pFbxSurfLambert = FbxSurfaceLambert::Create(pScene, rawMaterial.name.c_str());
+          auto props = std::static_pointer_cast<RawTraditionalMatProps>(rawMaterial.info);
+          
+          // Set material textures and constants
+          if (rawMaterial.textures[RAW_TEXTURE_USAGE_EMISSIVE] != -1) {
+            pFbxSurfLambert->Emissive.ConnectSrcObject(fbxTextures[rawMaterial.textures[RAW_TEXTURE_USAGE_EMISSIVE]]);
+          } else {
+            pFbxSurfLambert->Emissive = toFbxDouble3(props->emissiveFactor);
+          }
+
+          if (rawMaterial.textures[RAW_TEXTURE_USAGE_AMBIENT] != -1) {
+            pFbxSurfLambert->Ambient.ConnectSrcObject(fbxTextures[rawMaterial.textures[RAW_TEXTURE_USAGE_AMBIENT]]);
+          } else {
+            pFbxSurfLambert->Ambient = toFbxDouble3(props->ambientFactor);
+          }
+
+          if (rawMaterial.textures[RAW_TEXTURE_USAGE_DIFFUSE] != -1) {
+            pFbxSurfLambert->Diffuse.ConnectSrcObject(fbxTextures[rawMaterial.textures[RAW_TEXTURE_USAGE_DIFFUSE]]);
+          } else {
+            pFbxSurfLambert->Diffuse = toFbxVector4(props->diffuseFactor);
+          }
+
+          pFbxSurf = pFbxSurfLambert;
+        }
+        break;
+      case RAW_SHADING_MODEL_BLINN:
+        // TODO
+        break;
+      case RAW_SHADING_MODEL_PHONG:
+        {
+          // Create the surface
+          FbxSurfacePhong* pFbxSurfPhong = FbxSurfacePhong::Create(pScene, rawMaterial.name.c_str());
+          auto props = std::static_pointer_cast<RawTraditionalMatProps>(rawMaterial.info);
+          
+          // Set material textures and constants
+          // Set material textures and constants
+          if (rawMaterial.textures[RAW_TEXTURE_USAGE_EMISSIVE] != -1) {
+            pFbxSurfPhong->Emissive.ConnectSrcObject(fbxTextures[rawMaterial.textures[RAW_TEXTURE_USAGE_EMISSIVE]]);
+          } else {
+            pFbxSurfPhong->Emissive = toFbxDouble3(props->emissiveFactor);
+          }
+
+          if (rawMaterial.textures[RAW_TEXTURE_USAGE_AMBIENT] != -1) {
+            pFbxSurfPhong->Ambient.ConnectSrcObject(fbxTextures[rawMaterial.textures[RAW_TEXTURE_USAGE_AMBIENT]]);
+          } else {
+            pFbxSurfPhong->Ambient = toFbxDouble3(props->ambientFactor);
+          }
+
+          if (rawMaterial.textures[RAW_TEXTURE_USAGE_DIFFUSE] != -1) {
+            pFbxSurfPhong->Diffuse.ConnectSrcObject(fbxTextures[rawMaterial.textures[RAW_TEXTURE_USAGE_DIFFUSE]]);
+          } else {
+            pFbxSurfPhong->Diffuse = toFbxVector4(props->diffuseFactor);
+          }
+
+          if (rawMaterial.textures[RAW_TEXTURE_USAGE_NORMAL] != -1) {
+            pFbxSurfPhong->NormalMap.ConnectSrcObject(fbxTextures[rawMaterial.textures[RAW_TEXTURE_USAGE_NORMAL]]);
+          }
+
+          if (rawMaterial.textures[RAW_TEXTURE_USAGE_SPECULAR] != -1) {
+            pFbxSurfPhong->Specular.ConnectSrcObject(fbxTextures[rawMaterial.textures[RAW_TEXTURE_USAGE_SPECULAR]]);
+          } else {
+            pFbxSurfPhong->Specular = toFbxDouble3(props->specularFactor);;
+          }
+          pFbxSurfPhong->Shininess = props->shininess;
+
+          if (rawMaterial.textures[RAW_TEXTURE_USAGE_REFLECTION] != -1) {
+            pFbxSurfPhong->Reflection.ConnectSrcObject(fbxTextures[rawMaterial.textures[RAW_TEXTURE_USAGE_REFLECTION]]);
+          }
+
+          pFbxSurf = pFbxSurfPhong;
+        }
+        break;
+      case RAW_SHADING_MODEL_PBR_MET_ROUGH:
+        // TODO
+        break;
+      default:
+        break;
+    }
+
+    // Add the material to the map so we can connect it to the meshes that use it!
+    fbxSurfaceMaterials.push_back(pFbxSurf);
+  }
+
   int attributes = raw.GetVertexAttributes();
 
   // Create all the meshes from surfaces
   std::map<long, FbxMesh*> surfaceIdToFbxMeshMap;
+  // We'll also keep track of the materials used by surfaces
+  std::map<long, int> surfaceIdToMatIndexMap;
 
   for (int i = 0; i < raw.GetSurfaceCount(); ++i) {
     auto& surface = raw.GetSurface(i);
@@ -112,6 +238,10 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
       auto& tri = raw.GetTriangle(t);
       if (tri.surfaceIndex == i) {
         surfaceTriIndices.push_back(t);
+
+        // Add / Update the material index for this surface
+        surfaceIdToMatIndexMap[surface.id] = tri.materialIndex;
+
         for (int v = 0; v < 3; ++v) {
           // Have we already seen this vert?
           auto&& prevVertIt = surfaceVertIndexToMeshVertIndex.find(tri.verts[v]);
@@ -412,6 +542,24 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
 
       // Connect!!
       fbxNode->SetNodeAttribute(fbxMesh);
+
+      // Assign materials
+      // Right now, we only support a single material
+      int firstMaterialIndex = surfaceIdToMatIndexMap[node.surfaceId];
+      FbxSurfaceMaterial* fbxMat = fbxSurfaceMaterials[firstMaterialIndex];
+      if (fbxMat) {
+        FbxGeometryElementMaterial* pGeometryElementMaterial = fbxMesh->GetElementMaterial(0);
+        if (!pGeometryElementMaterial) {
+            pGeometryElementMaterial = fbxMesh->CreateElementMaterial();
+        }
+
+        // The material is mapped to the whole mesh
+        pGeometryElementMaterial->SetMappingMode(FbxGeometryElement::eAllSame);
+
+        // And the material is avalible in the Direct array
+        pGeometryElementMaterial->SetReferenceMode(FbxGeometryElement::eDirect);
+        fbxNode->AddMaterial(fbxMat);
+      }
     }
   }
 
@@ -509,6 +657,10 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
       // TODO: Weights...
     }
   }
+
+  // Lights
+
+  // Cameras
 
   return true;
 }
