@@ -12,10 +12,61 @@
 
 static double scaleFactor = 100.0; // Technically we compute it in Raw2Fbx, but it will also come out to 100 :)
 
-static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
-  
+class Raw2FbxConverter
+{
+public:
+  Raw2FbxConverter(const RawModel& rawModel, FbxScene* pFbxScene);
+  bool WriteNodeHierarchy();
+
+private:
+  bool CreateNodeHierarchy();
+  bool CreateTextures();
+  bool CreateMaterials();
+  FbxMesh* CreateBaseMesh(int surfaceIndex, std::vector<int>& surfaceVertIndices);
+  bool CreateSkeleton(const RawSurface& surface);
+  bool CreateSkin(const RawSurface& surface, const std::vector<int>& surfaceVertIndices);
+  bool CreateMorphTargets(const RawSurface& surface, const std::vector<int>& surfaceVertIndices);
+  bool CreateMeshes();
+  bool AssignMeshesAndMaterialsToNodes();
+  bool CreateAnimations();
+  bool CreateLights();
+  bool CreateCameras();
+
+private:
+  const RawModel& raw;
+  FbxScene* pScene;
+
+  // We need a small map of surface id to node(s) that use that surface
+  // This is initialized in the constructor
+  std::multimap<long, long> surfaceIdToNodeIdsMap;
   std::map<long, FbxNode*> idToFbxNodeMap;
-  
+  std::vector<FbxFileTexture*> fbxTextures;
+  std::vector<FbxSurfaceMaterial*> fbxSurfaceMaterials;
+  std::map<long, FbxMesh*> surfaceIdToFbxMeshMap;
+  std::map<long, int> surfaceIdToMatIndexMap;
+  int attributes;
+};
+
+
+Raw2FbxConverter::Raw2FbxConverter(const RawModel& rawModel, FbxScene* pFbxScene)
+: raw(rawModel)
+, pScene(pFbxScene)
+, attributes(rawModel.GetVertexAttributes())
+{
+  // Initialize our surface lookup map
+  for (int i = 0; i < raw.GetNodeCount(); ++i) {
+    // For any node that has a surface Id, add a mesh to the matching fbx node
+    auto& node = raw.GetNode(i);
+
+    // Does the node have a surface
+    if (node.surfaceId >= 0) {
+        // Add/Append a new entry
+        surfaceIdToNodeIdsMap.insert( {node.surfaceId, node.id } );
+    }
+  }
+}
+
+bool Raw2FbxConverter::CreateNodeHierarchy() {
   // Create all the matching fbx node of the raw model
   for (int i = 0; i < raw.GetNodeCount(); ++i) {
 
@@ -61,32 +112,11 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
       parentFbxNode->AddChild(fbxNode);
   }
 
-  // We need a small map of surface id to node(s) that use that surface
-  std::multimap<long, long> surfaceIdToNodeIdsMap;
-  for (int i = 0; i < raw.GetNodeCount(); ++i) {
-    // For any node that has a surface Id, add a mesh to the matching fbx node
-    auto& node = raw.GetNode(i);
+  return true;
+}
 
-    // Does the node have a surface
-    if (node.surfaceId >= 0) {
-        // Add/Append a new entry
-        surfaceIdToNodeIdsMap.insert( {node.surfaceId, node.id } );
-    }
-  }
-
-  // TODO: Write user defined properties if any
-  // // Only support non-animated user defined properties for now
-  // FbxProperty objectProperty = pNode->GetFirstProperty();
-  // while (objectProperty.IsValid()) {
-  //   if (objectProperty.GetFlag(FbxPropertyFlags::eUserDefined)) {
-  //     ReadNodeProperty(raw, pNode, objectProperty);
-  //   }
-
-  //   objectProperty = pNode->GetNextProperty(objectProperty);
-  // }
-
-  // Textures
-  std::vector<FbxFileTexture*> fbxTextures;
+bool Raw2FbxConverter::CreateTextures() {
+  // Create Textures
   for (int i = 0; i < raw.GetTextureCount(); ++i) {
     auto& rawTexture = raw.GetTexture(i);
     FbxFileTexture* pTexture = FbxFileTexture::Create(pScene, rawTexture.name.c_str());
@@ -111,8 +141,11 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
     fbxTextures.push_back(pTexture);
   }
 
+  return true;
+}
+
+bool Raw2FbxConverter::CreateMaterials() {
   // Materials
-  std::vector<FbxSurfaceMaterial*> fbxSurfaceMaterials;
   for (int i = 0; i < raw.GetMaterialCount(); ++i) {
     auto& rawMaterial = raw.GetMaterial(i);
     
@@ -208,322 +241,357 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
     fbxSurfaceMaterials.push_back(pFbxSurf);
   }
 
-  int attributes = raw.GetVertexAttributes();
+  return true;
+}
 
-  // Create all the meshes from surfaces
-  std::map<long, FbxMesh*> surfaceIdToFbxMeshMap;
-  // We'll also keep track of the materials used by surfaces
-  std::map<long, int> surfaceIdToMatIndexMap;
+FbxMesh* Raw2FbxConverter::CreateBaseMesh(int surfaceIndex, std::vector<int>& surfaceVertIndices) {
 
-  for (int i = 0; i < raw.GetSurfaceCount(); ++i) {
-    auto& surface = raw.GetSurface(i);
-    FbxMesh* fbxMesh = FbxMesh::Create(pScene, surface.name.c_str());
-    
-    // Add the mesh to the map, so we can map it later to actual fbx nodes
-    surfaceIdToFbxMeshMap[surface.id] = fbxMesh;
+  auto& surface = raw.GetSurface(surfaceIndex);
 
-    // We need to collect all the triangles and verts of this surface
+  FbxMesh* fbxMesh = FbxMesh::Create(pScene, surface.name.c_str());
+  
+  // We need to collect all the triangles and verts of this surface
 
-    // We'll store the indices of the triangles and verts used by this surface
-    std::vector<int> surfaceTriIndices;
-    std::vector<int> surfaceVertIndices;
+  // We'll store the indices of the triangles and verts used by this surface
+  std::vector<int> surfaceTriIndices;
 
-    // And a mapping of the verts index in the raw model to the vert index in the collected array above
-    // For this we iterate over all the triangles in the model and select the ones that match this surface.
-    // With a lot of surfaces this will be very inefficient, and should instead split the process up
-    // with more intermediate data and lookup.
-    std::map<int, int> surfaceVertIndexToMeshVertIndex;
-    for (int t = 0; t < raw.GetTriangleCount(); ++t)
-    {
-      auto& tri = raw.GetTriangle(t);
-      if (tri.surfaceIndex == i) {
-        surfaceTriIndices.push_back(t);
+  // And a mapping of the verts index in the raw model to the vert index in the collected array above
+  // For this we iterate over all the triangles in the model and select the ones that match this surface.
+  // With a lot of surfaces this will be very inefficient, and should instead split the process up
+  // with more intermediate data and lookup.
+  std::map<int, int> surfaceVertIndexToMeshVertIndex;
+  for (int t = 0; t < raw.GetTriangleCount(); ++t)
+  {
+    auto& tri = raw.GetTriangle(t);
+    if (tri.surfaceIndex == surfaceIndex) {
+      surfaceTriIndices.push_back(t);
 
-        // Add / Update the material index for this surface
-        surfaceIdToMatIndexMap[surface.id] = tri.materialIndex;
+      // Add / Update the material index for this surface
+      surfaceIdToMatIndexMap[surface.id] = tri.materialIndex;
 
-        for (int v = 0; v < 3; ++v) {
-          // Have we already seen this vert?
-          auto&& prevVertIt = surfaceVertIndexToMeshVertIndex.find(tri.verts[v]);
-          if (prevVertIt == surfaceVertIndexToMeshVertIndex.end()) {
-            // We have not! add it! First Add the index lookup
-            surfaceVertIndexToMeshVertIndex[tri.verts[v]] = surfaceVertIndices.size();
+      for (int v = 0; v < 3; ++v) {
+        // Have we already seen this vert?
+        auto&& prevVertIt = surfaceVertIndexToMeshVertIndex.find(tri.verts[v]);
+        if (prevVertIt == surfaceVertIndexToMeshVertIndex.end()) {
+          // We have not! add it! First Add the index lookup
+          surfaceVertIndexToMeshVertIndex[tri.verts[v]] = surfaceVertIndices.size();
 
-            // And add to the vert list
-            surfaceVertIndices.push_back(tri.verts[v]);
-          }
-          // Else we've seen this vert already
+          // And add to the vert list
+          surfaceVertIndices.push_back(tri.verts[v]);
         }
+        // Else we've seen this vert already
       }
-      // Else this triangle doesn't interest us
+    }
+    // Else this triangle doesn't interest us
+  }
+
+  // Let's start by adding all the verts to the mesh
+  fbxMesh->InitControlPoints(surfaceVertIndices.size());
+
+  // Add geometry elements based on the vertex attributes
+  FbxVector4* controlPoints = nullptr;
+  if (attributes & RAW_VERTEX_ATTRIBUTE_POSITION) {
+    controlPoints = fbxMesh->GetControlPoints();
+  }
+
+  FbxGeometryElementNormal* lGeometryElementNormal = nullptr;
+  if (attributes & RAW_VERTEX_ATTRIBUTE_NORMAL) {
+    lGeometryElementNormal = fbxMesh->CreateElementNormal();
+    lGeometryElementNormal->SetMappingMode(FbxGeometryElement::eByControlPoint);
+    lGeometryElementNormal->SetReferenceMode(FbxGeometryElement::eDirect);
+  }
+
+  FbxGeometryElementTangent* lGeometryElementTangent = nullptr;
+  if (attributes & RAW_VERTEX_ATTRIBUTE_TANGENT) {
+    lGeometryElementTangent = fbxMesh->CreateElementTangent();
+    lGeometryElementTangent->SetMappingMode(FbxGeometryElement::eByControlPoint);
+    lGeometryElementTangent->SetReferenceMode(FbxGeometryElement::eDirect);
+  }
+
+  FbxGeometryElementBinormal* lGeometryElementBinormal = nullptr;
+  if (attributes & RAW_VERTEX_ATTRIBUTE_BINORMAL) {
+    lGeometryElementBinormal = fbxMesh->CreateElementBinormal();
+    lGeometryElementBinormal->SetMappingMode(FbxGeometryElement::eByControlPoint);
+    lGeometryElementBinormal->SetReferenceMode(FbxGeometryElement::eDirect);
+  }
+
+  FbxGeometryElementVertexColor* lGeometryElementVertexColor = nullptr;
+  if (attributes & RAW_VERTEX_ATTRIBUTE_COLOR) {
+    lGeometryElementVertexColor = fbxMesh->CreateElementVertexColor();
+    lGeometryElementVertexColor->SetMappingMode(FbxGeometryElement::eByControlPoint);
+    lGeometryElementVertexColor->SetReferenceMode(FbxGeometryElement::eDirect);
+  }
+
+  FbxGeometryElementUV* lGeometryElementUV0 = nullptr;
+  if (attributes & RAW_VERTEX_ATTRIBUTE_UV0) {
+    // Not sure that I am using the correct layer element type here...
+    lGeometryElementUV0 = fbxMesh->CreateElementUV((surface.name + "UV0").c_str(), FbxLayerElement::eTextureDiffuse);
+    lGeometryElementUV0->SetMappingMode(FbxGeometryElement::eByControlPoint);
+    lGeometryElementUV0->SetReferenceMode(FbxGeometryElement::eDirect);
+  }
+
+  FbxGeometryElementUV* lGeometryElementUV1 = nullptr;
+  if (attributes & RAW_VERTEX_ATTRIBUTE_UV1) {
+    // Not sure that I am using the correct layer element type here...
+    lGeometryElementUV1 = fbxMesh->CreateElementUV((surface.name + "UV1").c_str(), FbxLayerElement::eUV);
+    lGeometryElementUV1->SetMappingMode(FbxGeometryElement::eByControlPoint);
+    lGeometryElementUV1->SetReferenceMode(FbxGeometryElement::eDirect);
+  }
+
+  for (int v = 0; v < surfaceVertIndices.size(); ++v) {
+    auto& vert = raw.GetVertex(surfaceVertIndices[v]);
+
+    if (attributes & RAW_VERTEX_ATTRIBUTE_POSITION) {
+      controlPoints[v] = toFbxVector4Position(vert.position);
     }
 
-    // Let's start by adding all the verts to the mesh
-    fbxMesh->InitControlPoints(surfaceVertIndices.size());
+    if (attributes & RAW_VERTEX_ATTRIBUTE_NORMAL) {
+      lGeometryElementNormal->GetDirectArray().Add(toFbxVector4Vector(vert.normal));
+    }
+
+    if (attributes & RAW_VERTEX_ATTRIBUTE_TANGENT) {
+      lGeometryElementTangent->GetDirectArray().Add(toFbxVector4(vert.tangent));
+    }
+
+    if (attributes & RAW_VERTEX_ATTRIBUTE_BINORMAL) {
+      lGeometryElementBinormal->GetDirectArray().Add(toFbxVector4Vector(vert.binormal));
+    }
+
+    if (attributes & RAW_VERTEX_ATTRIBUTE_COLOR) {
+      lGeometryElementVertexColor->GetDirectArray().Add(toFbxColor(vert.color));
+    }
+
+    if (attributes & RAW_VERTEX_ATTRIBUTE_UV0) {
+      lGeometryElementUV0->GetDirectArray().Add(toFbxVector2(vert.uv0));
+    }
+
+    if (attributes & RAW_VERTEX_ATTRIBUTE_UV1) {
+      lGeometryElementUV1->GetDirectArray().Add(toFbxVector2(vert.uv1));
+    }
+  }
+
+  // Create Polygons for each triangle of the surface
+  for (int t = 0; t < surfaceTriIndices.size(); ++t) {
+    auto& tri = raw.GetTriangle(surfaceTriIndices[t]);
+    fbxMesh->BeginPolygon(-1, -1, -1, false);
+    fbxMesh->AddPolygon(surfaceVertIndexToMeshVertIndex[tri.verts[0]]);
+    fbxMesh->AddPolygon(surfaceVertIndexToMeshVertIndex[tri.verts[1]]);
+    fbxMesh->AddPolygon(surfaceVertIndexToMeshVertIndex[tri.verts[2]]);
+    fbxMesh->EndPolygon();
+  }
+
+  return fbxMesh;
+}
+
+bool Raw2FbxConverter::CreateSkeleton(const RawSurface& surface) {
+  // Create the skeletons
+  auto& rawSkeletonRootNode = raw.GetNode(raw.GetNodeById(surface.skeletonRootId));
+  if (!rawSkeletonRootNode.isJoint) {
+    return false;
+  }
+
+  FbxSkeleton* pSkeletonRootAttribute = FbxSkeleton::Create(pScene, rawSkeletonRootNode.name.c_str());
+  pSkeletonRootAttribute->SetSkeletonType(FbxSkeleton::eLimb);
+  FbxNode* pSkeletonRoot = idToFbxNodeMap[surface.skeletonRootId];
+  pSkeletonRoot->SetNodeAttribute(pSkeletonRootAttribute);
+
+  // Now iterate through the children and children of children
+
+  // Define a lambda to do the work of adding a skeleton attribute to a bone node and
+  // recursing through the hierarchy of bones
+  std::function<void(int)> attachSkeletonAttribute = [&] (int skeletonNodeId) {
+    auto& rawSkeletonNode = raw.GetNode(raw.GetNodeById(skeletonNodeId));
+    if (!rawSkeletonNode.isJoint) {
+      // Skip non-joints in the joint chain.
+      return;
+    }
+
+    // Add the skeleton attribute to the node
+    FbxSkeleton* pSkeletonNodeAttribute = FbxSkeleton::Create(pScene, rawSkeletonNode.name.c_str());
+    // SDK seems to indicate that the type should be eEffector for the last node in a tree, but
+    // the examples don't follow that, so not sure if it is really necessary
+    pSkeletonNodeAttribute->SetSkeletonType(FbxSkeleton::eLimb); 
+    FbxNode* pSkeletonNode = idToFbxNodeMap[skeletonNodeId];
+    pSkeletonNode->SetNodeAttribute(pSkeletonNodeAttribute);
+
+    // Recurse!
+    for (int c = 0; c < rawSkeletonNode.childIds.size(); ++c) {
+      attachSkeletonAttribute(rawSkeletonNode.childIds[c]);
+    }
+  };
+
+  // Start by doing the work on children of the root
+  for (auto childId : rawSkeletonRootNode.childIds) {
+    attachSkeletonAttribute(childId);
+  }
+  return true;
+}
+
+bool Raw2FbxConverter::CreateSkin(const RawSurface& surface, const std::vector<int>& surfaceVertIndices) {
+
+  // Find the (first/only?) node that corresponds to the surface
+  auto rawPatchNodeIdIt = surfaceIdToNodeIdsMap.find(surface.id);
+  assert(rawPatchNodeIdIt != surfaceIdToNodeIdsMap.end());
+  long rawPatchNodeId = rawPatchNodeIdIt->second;
+  auto& rawPatchNode = raw.GetNode(raw.GetNodeById(rawPatchNodeId));
+
+  FbxAMatrix transformMatrix;
+  transformMatrix.SetTQS(
+    toFbxVector4Vector(rawPatchNode.translation),
+    toFbxQuaternion(rawPatchNode.rotation),
+    toFbxVector4Vector(rawPatchNode.scale));
+
+  // Build a map of verts affected by each bone
+  std::map<long, FbxCluster*> rawBoneNodeIdToClusterMap;
+
+  // To do this, we iterate all the verts of the surface,
+  // adding the vert to the proper cluster as we go.
+  for (int v = 0; v < surfaceVertIndices.size(); ++v) {
+    auto& vert = raw.GetVertex(surfaceVertIndices[v]);
+
+    // Up to 4 joints per vert
+    for (int j = 0; j < 4; ++j) {
+      int jointIndex = vert.jointIndices[j];
+      if (jointIndex >= 0) {
+        float jointWeight = vert.jointWeights[j];
+        if (jointWeight > 0.0f) {
+          // From the index, we want the node id, so we can look it up
+          long skeletonNodeId = surface.jointIds[jointIndex];
+
+          // Find the cluster for this joint
+          FbxCluster* pCluster = nullptr;
+          auto clusterIt = rawBoneNodeIdToClusterMap.find(skeletonNodeId);
+          if (clusterIt == rawBoneNodeIdToClusterMap.end()) {
+            // There isn't one already, create a cluster for this bone
+            auto& rawSkeletonNode = raw.GetNode(raw.GetNodeById(skeletonNodeId));
+            FbxNode* pSkeletonNode = idToFbxNodeMap[skeletonNodeId];
+
+            pCluster = FbxCluster::Create(pScene, rawSkeletonNode.name.c_str());
+            pCluster->SetLink(pSkeletonNode);
+            pCluster->SetLinkMode(FbxCluster::eNormalize);
+
+            // Set the transforms
+            pCluster->SetTransformMatrix(transformMatrix);
+            pCluster->SetTransformLinkMatrix(transformMatrix * toFbxAMatrix(surface.inverseBindMatrices[jointIndex].Inverse()));
+
+            // Add the cluster to the map
+            rawBoneNodeIdToClusterMap[skeletonNodeId] = pCluster;
+          } else {
+            // There was already a cluster for this bone
+            pCluster = clusterIt->second;
+          }
+
+          assert(pCluster); // FIXME, Add error message
+          pCluster->AddControlPointIndex(v, jointWeight);
+        }
+      }
+    }
+  }
+
+  // Add the skin to the mesh, and the clusters to the skin!
+  FbxSkin* pSkin = FbxSkin::Create(pScene, surface.name.c_str());
+  pSkin->SetSkinningType(FbxSkin::eBlend);
+
+  for (auto idAndCluster : rawBoneNodeIdToClusterMap) {
+    pSkin->AddCluster(idAndCluster.second);
+  }
+
+  // Attach the skin deformer to the mesh
+  FbxMesh* fbxMesh = surfaceIdToFbxMeshMap[surface.id];
+  fbxMesh->AddDeformer(pSkin);
+
+  return true;
+}
+
+bool Raw2FbxConverter::CreateMorphTargets(const RawSurface& surface, const std::vector<int>& surfaceVertIndices) {
+  // Blend channels. This is kind of like skinning data, in that FBX works
+  // the opposite way that RAW does. Raw stores the blends in each vertex,
+  // while the FBX stores a modifier with a duplicate shape (i.e mesh) for
+  // each channel.
+  for (int c = 0; c < surface.blendChannels.size(); ++c) {
+    // For each channel, we need to create a new shape and control points
+    auto& channel = surface.blendChannels[c];
+
+    // Creathe shape etc...
+    FbxShape* pShape = FbxShape::Create(pScene, channel.name.c_str());
+    pShape->InitControlPoints(surfaceVertIndices.size());
 
     // Add geometry elements based on the vertex attributes
     FbxVector4* controlPoints = nullptr;
     if (attributes & RAW_VERTEX_ATTRIBUTE_POSITION) {
-      controlPoints = fbxMesh->GetControlPoints();
+      controlPoints = pShape->GetControlPoints();
     }
 
     FbxGeometryElementNormal* lGeometryElementNormal = nullptr;
     if (attributes & RAW_VERTEX_ATTRIBUTE_NORMAL) {
-      lGeometryElementNormal = fbxMesh->CreateElementNormal();
+      lGeometryElementNormal = pShape->CreateElementNormal();
       lGeometryElementNormal->SetMappingMode(FbxGeometryElement::eByControlPoint);
       lGeometryElementNormal->SetReferenceMode(FbxGeometryElement::eDirect);
     }
 
     FbxGeometryElementTangent* lGeometryElementTangent = nullptr;
     if (attributes & RAW_VERTEX_ATTRIBUTE_TANGENT) {
-      lGeometryElementTangent = fbxMesh->CreateElementTangent();
+      lGeometryElementTangent = pShape->CreateElementTangent();
       lGeometryElementTangent->SetMappingMode(FbxGeometryElement::eByControlPoint);
       lGeometryElementTangent->SetReferenceMode(FbxGeometryElement::eDirect);
-    }
-
-    FbxGeometryElementBinormal* lGeometryElementBinormal = nullptr;
-    if (attributes & RAW_VERTEX_ATTRIBUTE_BINORMAL) {
-      lGeometryElementBinormal = fbxMesh->CreateElementBinormal();
-      lGeometryElementBinormal->SetMappingMode(FbxGeometryElement::eByControlPoint);
-      lGeometryElementBinormal->SetReferenceMode(FbxGeometryElement::eDirect);
-    }
-
-    FbxGeometryElementVertexColor* lGeometryElementVertexColor = nullptr;
-    if (attributes & RAW_VERTEX_ATTRIBUTE_COLOR) {
-      lGeometryElementVertexColor = fbxMesh->CreateElementVertexColor();
-      lGeometryElementVertexColor->SetMappingMode(FbxGeometryElement::eByControlPoint);
-      lGeometryElementVertexColor->SetReferenceMode(FbxGeometryElement::eDirect);
-    }
-
-    FbxGeometryElementUV* lGeometryElementUV0 = nullptr;
-    if (attributes & RAW_VERTEX_ATTRIBUTE_UV0) {
-      // Not sure that I am using the correct layer element type here...
-      lGeometryElementUV0 = fbxMesh->CreateElementUV((surface.name + "UV0").c_str(), FbxLayerElement::eTextureDiffuse);
-      lGeometryElementUV0->SetMappingMode(FbxGeometryElement::eByControlPoint);
-      lGeometryElementUV0->SetReferenceMode(FbxGeometryElement::eDirect);
-    }
-
-    FbxGeometryElementUV* lGeometryElementUV1 = nullptr;
-    if (attributes & RAW_VERTEX_ATTRIBUTE_UV1) {
-      // Not sure that I am using the correct layer element type here...
-      lGeometryElementUV1 = fbxMesh->CreateElementUV((surface.name + "UV1").c_str(), FbxLayerElement::eUV);
-      lGeometryElementUV1->SetMappingMode(FbxGeometryElement::eByControlPoint);
-      lGeometryElementUV1->SetReferenceMode(FbxGeometryElement::eDirect);
     }
 
     for (int v = 0; v < surfaceVertIndices.size(); ++v) {
       auto& vert = raw.GetVertex(surfaceVertIndices[v]);
 
       if (attributes & RAW_VERTEX_ATTRIBUTE_POSITION) {
-        controlPoints[v] = toFbxVector4Position(vert.position);
+        controlPoints[v] = toFbxVector4Position(vert.blends[c].position + vert.position);
       }
 
       if (attributes & RAW_VERTEX_ATTRIBUTE_NORMAL) {
-        lGeometryElementNormal->GetDirectArray().Add(toFbxVector4Vector(vert.normal));
+        lGeometryElementNormal->GetDirectArray().Add(toFbxVector4Vector(vert.blends[c].normal + vert.normal));
       }
 
       if (attributes & RAW_VERTEX_ATTRIBUTE_TANGENT) {
-        lGeometryElementTangent->GetDirectArray().Add(toFbxVector4(vert.tangent));
-      }
-
-      if (attributes & RAW_VERTEX_ATTRIBUTE_BINORMAL) {
-        lGeometryElementBinormal->GetDirectArray().Add(toFbxVector4Vector(vert.binormal));
-      }
-
-      if (attributes & RAW_VERTEX_ATTRIBUTE_COLOR) {
-        lGeometryElementVertexColor->GetDirectArray().Add(toFbxColor(vert.color));
-      }
-
-      if (attributes & RAW_VERTEX_ATTRIBUTE_UV0) {
-        lGeometryElementUV0->GetDirectArray().Add(toFbxVector2(vert.uv0));
-      }
-
-      if (attributes & RAW_VERTEX_ATTRIBUTE_UV1) {
-        lGeometryElementUV1->GetDirectArray().Add(toFbxVector2(vert.uv1));
+        lGeometryElementTangent->GetDirectArray().Add(toFbxVector4(vert.blends[c].tangent + vert.tangent));
       }
     }
 
-    // Create Polygons for each triangle of the surface
-    for (int t = 0; t < surfaceTriIndices.size(); ++t) {
-      auto& tri = raw.GetTriangle(surfaceTriIndices[t]);
-      fbxMesh->BeginPolygon(-1, -1, -1, false);
-      fbxMesh->AddPolygon(surfaceVertIndexToMeshVertIndex[tri.verts[0]]);
-      fbxMesh->AddPolygon(surfaceVertIndexToMeshVertIndex[tri.verts[1]]);
-      fbxMesh->AddPolygon(surfaceVertIndexToMeshVertIndex[tri.verts[2]]);
-      fbxMesh->EndPolygon();
-    }
+    // Now associate this shape with a channel
+    FbxBlendShape* pBlendShape = FbxBlendShape::Create(pScene, channel.name.c_str());
+    FbxBlendShapeChannel* pBlendShapeChannel = FbxBlendShapeChannel::Create(pScene, channel.name.c_str());
+    pBlendShape->AddBlendShapeChannel(pBlendShapeChannel);
+    pBlendShapeChannel->AddTargetShape(pShape);
+
+    // And finally the modifier to the mesh
+    FbxMesh* fbxMesh = surfaceIdToFbxMeshMap[surface.id];
+    fbxMesh->AddDeformer(pBlendShape);
+  }
+  return true;
+}
+
+bool Raw2FbxConverter::CreateMeshes() {
+  for (int i = 0; i < raw.GetSurfaceCount(); ++i) {
+    auto& surface = raw.GetSurface(i);
+
+    // Create the base mesh for this surface
+    std::vector<int> surfaceVertIndices;
+    FbxMesh* fbxMesh = CreateBaseMesh(i, surfaceVertIndices);
+
+    // Add the mesh to the map, so we can map it later to actual fbx nodes
+    surfaceIdToFbxMeshMap[surface.id] = fbxMesh;
 
     // Skinning
     if (attributes & RAW_VERTEX_ATTRIBUTE_JOINT_INDICES || attributes & RAW_VERTEX_ATTRIBUTE_JOINT_WEIGHTS) {
 
-      // Find the (first/only?) node that corresponds to the surface
-      auto rawPatchNodeIdIt = surfaceIdToNodeIdsMap.find(surface.id);
-      assert(rawPatchNodeIdIt != surfaceIdToNodeIdsMap.end());
-      long rawPatchNodeId = rawPatchNodeIdIt->second;
-      auto& rawPatchNode = raw.GetNode(raw.GetNodeById(rawPatchNodeId));
-      FbxAMatrix transformMatrix;
-      transformMatrix.SetTQS(
-        toFbxVector4Vector(rawPatchNode.translation),
-        toFbxQuaternion(rawPatchNode.rotation),
-        toFbxVector4Vector(rawPatchNode.scale));
+      // First create the skeleton for this surface, if any
+      CreateSkeleton(surface);
 
-      // Create the skeletons
-      auto& rawSkeletonRootNode = raw.GetNode(raw.GetNodeById(surface.skeletonRootId));
-      if (!rawSkeletonRootNode.isJoint) {
-        continue;
-      }
-
-      FbxSkeleton* pSkeletonRootAttribute = FbxSkeleton::Create(pScene, rawSkeletonRootNode.name.c_str());
-      pSkeletonRootAttribute->SetSkeletonType(FbxSkeleton::eLimb);
-      FbxNode* pSkeletonRoot = idToFbxNodeMap[surface.skeletonRootId];
-      pSkeletonRoot->SetNodeAttribute(pSkeletonRootAttribute);
-
-      // Now iterate through the children and children of children
-      //
-
-      // Define a lambda to do the work of adding a skeleton attribute to a bone node and
-      // recursing through the hierarchy of bones
-      std::function<void(int)> attachSkeletonAttribute = [&] (int skeletonNodeId) {
-        auto& rawSkeletonNode = raw.GetNode(raw.GetNodeById(skeletonNodeId));
-        if (!rawSkeletonNode.isJoint) {
-          // Skip non-joints in the joint chain.
-          return;
-        }
-
-        // Add the skeleton attribute to the node
-        FbxSkeleton* pSkeletonNodeAttribute = FbxSkeleton::Create(pScene, rawSkeletonNode.name.c_str());
-        // SDK seems to indicate that the type should be eEffector for the last node in a tree, but
-        // the examples don't follow that, so not sure if it is really necessary
-        pSkeletonNodeAttribute->SetSkeletonType(FbxSkeleton::eLimb); 
-        FbxNode* pSkeletonNode = idToFbxNodeMap[skeletonNodeId];
-        pSkeletonNode->SetNodeAttribute(pSkeletonNodeAttribute);
-
-        // Recurse!
-        for (int c = 0; c < rawSkeletonNode.childIds.size(); ++c) {
-          attachSkeletonAttribute(rawSkeletonNode.childIds[c]);
-        }
-      };
-
-      // Start by doing the work on children of the root
-      for (auto childId : rawSkeletonRootNode.childIds) {
-        attachSkeletonAttribute(childId);
-      }
-
-      // Build a map of verts affected by each bone
-      std::map<long, FbxCluster*> rawBoneNodeIdToClusterMap;
-
-      // To do this, we iterate all the verts of the surface,
-      // adding the vert to the proper cluster as we go.
-      for (int v = 0; v < surfaceVertIndices.size(); ++v) {
-        auto& vert = raw.GetVertex(surfaceVertIndices[v]);
-
-        // Up to 4 joints per vert
-        for (int j = 0; j < 4; ++j) {
-          int jointIndex = vert.jointIndices[j];
-          if (jointIndex >= 0) {
-            float jointWeight = vert.jointWeights[j];
-            if (jointWeight > 0.0f) {
-              // From the index, we want the node id, so we can look it up
-              long skeletonNodeId = surface.jointIds[jointIndex];
-
-              // Find the cluster for this joint
-              FbxCluster* pCluster = nullptr;
-              auto clusterIt = rawBoneNodeIdToClusterMap.find(skeletonNodeId);
-              if (clusterIt == rawBoneNodeIdToClusterMap.end()) {
-                // There isn't one already, create a cluster for this bone
-                auto& rawSkeletonNode = raw.GetNode(raw.GetNodeById(skeletonNodeId));
-                FbxNode* pSkeletonNode = idToFbxNodeMap[skeletonNodeId];
-
-                pCluster = FbxCluster::Create(pScene, rawSkeletonNode.name.c_str());
-                pCluster->SetLink(pSkeletonNode);
-                pCluster->SetLinkMode(FbxCluster::eNormalize);
-
-                // Set the transforms
-                pCluster->SetTransformMatrix(transformMatrix);
-                pCluster->SetTransformLinkMatrix(transformMatrix * toFbxAMatrix(surface.inverseBindMatrices[jointIndex].Inverse()));
-
-                // Add the cluster to the map
-                rawBoneNodeIdToClusterMap[skeletonNodeId] = pCluster;
-              } else {
-                // There was already a cluster for this bone
-                pCluster = clusterIt->second;
-              }
-
-              assert(pCluster); // FIXME, Add error message
-              pCluster->AddControlPointIndex(v, jointWeight);
-            }
-          }
-        }
-      }
-
-      // Add the skin to the mesh, and the clusters to the skin!
-      FbxSkin* pSkin = FbxSkin::Create(pScene, surface.name.c_str());
-      pSkin->SetSkinningType(FbxSkin::eBlend);
-
-      for (auto idAndCluster : rawBoneNodeIdToClusterMap) {
-        pSkin->AddCluster(idAndCluster.second);
-      }
-      fbxMesh->AddDeformer(pSkin);
+      CreateSkin(surface, surfaceVertIndices);
     }
 
-
-    // Blend channels. This is kind of like skinning data, in that FBX works
-    // the opposite way that RAW does. Raw stores the blends in each vertex,
-    // while the FBX stores a modifier with a duplicate shape (i.e mesh) for
-    // each channel.
-    for (int c = 0; c < surface.blendChannels.size(); ++c) {
-      // For each channel, we need to create a new shape and control points
-      auto& channel = surface.blendChannels[c];
-
-      // Creathe shape etc...
-      FbxShape* pShape = FbxShape::Create(pScene, channel.name.c_str());
-      pShape->InitControlPoints(surfaceVertIndices.size());
-
-      // Add geometry elements based on the vertex attributes
-      FbxVector4* controlPoints = nullptr;
-      if (attributes & RAW_VERTEX_ATTRIBUTE_POSITION) {
-        controlPoints = pShape->GetControlPoints();
-      }
-
-      FbxGeometryElementNormal* lGeometryElementNormal = nullptr;
-      if (attributes & RAW_VERTEX_ATTRIBUTE_NORMAL) {
-        lGeometryElementNormal = pShape->CreateElementNormal();
-        lGeometryElementNormal->SetMappingMode(FbxGeometryElement::eByControlPoint);
-        lGeometryElementNormal->SetReferenceMode(FbxGeometryElement::eDirect);
-      }
-
-      FbxGeometryElementTangent* lGeometryElementTangent = nullptr;
-      if (attributes & RAW_VERTEX_ATTRIBUTE_TANGENT) {
-        lGeometryElementTangent = pShape->CreateElementTangent();
-        lGeometryElementTangent->SetMappingMode(FbxGeometryElement::eByControlPoint);
-        lGeometryElementTangent->SetReferenceMode(FbxGeometryElement::eDirect);
-      }
-
-      for (int v = 0; v < surfaceVertIndices.size(); ++v) {
-        auto& vert = raw.GetVertex(surfaceVertIndices[v]);
-
-        if (attributes & RAW_VERTEX_ATTRIBUTE_POSITION) {
-          controlPoints[v] = toFbxVector4Position(vert.blends[c].position + vert.position);
-        }
-
-        if (attributes & RAW_VERTEX_ATTRIBUTE_NORMAL) {
-          lGeometryElementNormal->GetDirectArray().Add(toFbxVector4Vector(vert.blends[c].normal + vert.normal));
-        }
-
-        if (attributes & RAW_VERTEX_ATTRIBUTE_TANGENT) {
-          lGeometryElementTangent->GetDirectArray().Add(toFbxVector4(vert.blends[c].tangent + vert.tangent));
-        }
-      }
-
-      // Now associate this shape with a channel
-      FbxBlendShape* pBlendShape = FbxBlendShape::Create(pScene, channel.name.c_str());
-      FbxBlendShapeChannel* pBlendShapeChannel = FbxBlendShapeChannel::Create(pScene, channel.name.c_str());
-      fbxMesh->AddDeformer(pBlendShape);
-      pBlendShape->AddBlendShapeChannel(pBlendShapeChannel);
-      pBlendShapeChannel->AddTargetShape(pShape);
-    }
+    CreateMorphTargets(surface, surfaceVertIndices);
   }
 
+  return true;
+}
+
+bool Raw2FbxConverter::AssignMeshesAndMaterialsToNodes() {
   // Now for each node that has a valid surface Id, associate the fbxMesh with the
   // correct fbxNode. This means a mesh can be associated with multiple nodes if desired.
   // I don't know if that's the right thing to do, but it seems valid based on the sdk.
@@ -562,7 +630,10 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
       }
     }
   }
+  return true;
+}
 
+bool Raw2FbxConverter::CreateAnimations() {
   // Animations
   for (int i = 0; i < raw.GetAnimationCount(); ++i) {
     // Get raw animation
@@ -657,10 +728,103 @@ static bool WriteNodeHierarchy(const RawModel& raw, FbxScene* pScene) {
       // TODO: Weights...
     }
   }
+  return true;
+}
 
-  // Lights
+bool Raw2FbxConverter::CreateLights() {
 
-  // Cameras
+  std::vector<FbxLight*> lights;
+  for (int i = 0; i < raw.GetLightCount(); ++i) {
+    auto& rawLight = raw.GetLight(i);
+    FbxLight* pLight = FbxLight::Create(pScene, rawLight.name.c_str());
+
+    switch (rawLight.type)
+    {
+      case RAW_LIGHT_TYPE_DIRECTIONAL:
+        pLight->LightType.Set(FbxLight::eDirectional);
+        break;
+      case RAW_LIGHT_TYPE_POINT:
+        pLight->LightType.Set(FbxLight::ePoint);
+        break;
+      case RAW_LIGHT_TYPE_SPOT:
+        pLight->LightType.Set(FbxLight::eSpot);
+        pLight->InnerAngle.Set(rawLight.innerConeAngle * 180 / M_PI);
+        pLight->OuterAngle.Set(rawLight.outerConeAngle * 180 / M_PI);
+        break;
+    }
+
+    pLight->Color.Set(toFbxDouble3(rawLight.color));
+    pLight->Intensity.Set(rawLight.intensity);
+    lights.push_back(pLight);
+  }
+
+  for (int i = 0; i < raw.GetNodeCount(); ++i) {
+    // For any node that has a surface Id, add a mesh to the matching fbx node
+    auto& node = raw.GetNode(i);
+    if (node.lightIx != -1) {
+      // Attach light to its node
+      FbxNode* pLightNode = idToFbxNodeMap[node.id];
+      pLightNode->SetNodeAttribute(lights[node.lightIx]);
+    }
+  }
+
+  return true;
+}
+
+bool Raw2FbxConverter::CreateCameras() {
+  for (int i = 0; i < raw.GetCameraCount(); ++i) {
+    auto& rawCam = raw.GetCamera(i);
+    FbxCamera* pCam = FbxCamera::Create(pScene, rawCam.name.c_str());
+
+    // Set all camera properties
+    switch (rawCam.mode)
+    {
+      case RawCamera::CAMERA_MODE_PERSPECTIVE:
+        pCam->ProjectionType.Set(FbxCamera::ePerspective);
+        pCam->FieldOfViewX.Set(rawCam.perspective.fovDegreesX);
+        pCam->FieldOfViewY.Set(rawCam.perspective.fovDegreesY);
+        pCam->FilmAspectRatio.Set(rawCam.perspective.aspectRatio);
+        pCam->NearPlane.Set(rawCam.perspective.nearZ);
+        pCam->FarPlane.Set(rawCam.perspective.farZ);
+        break;
+      case RawCamera::CAMERA_MODE_ORTHOGRAPHIC:
+        pCam->ProjectionType.Set(FbxCamera::eOrthogonal);
+        pCam->OrthoZoom.Set(rawCam.orthographic.magX);
+        pCam->FarPlane.Set(rawCam.orthographic.farZ);
+        pCam->NearPlane.Set(rawCam.orthographic.nearZ);
+        break;
+    }
+
+    // Attach cam to its node
+    FbxNode* pCamNode = idToFbxNodeMap[rawCam.nodeId];
+    pCamNode->SetNodeAttribute(pCam);
+  }
+
+  return true;
+}
+
+bool Raw2FbxConverter::WriteNodeHierarchy() {
+  
+  CreateNodeHierarchy();
+  
+  // TODO: Write user defined properties if any
+  // // Only support non-animated user defined properties for now
+  // FbxProperty objectProperty = pNode->GetFirstProperty();
+  // while (objectProperty.IsValid()) {
+  //   if (objectProperty.GetFlag(FbxPropertyFlags::eUserDefined)) {
+  //     ReadNodeProperty(raw, pNode, objectProperty);
+  //   }
+
+  //   objectProperty = pNode->GetNextProperty(objectProperty);
+  // }
+
+  CreateTextures();
+  CreateMaterials();
+  CreateMeshes();
+  AssignMeshesAndMaterialsToNodes();
+  CreateAnimations();
+  CreateLights();
+  CreateCameras();
 
   return true;
 }
@@ -691,7 +855,8 @@ bool Raw2FBX(const std::string& outputPath, const RawModel& raw, const GltfOptio
     scaleFactor = FbxSystemUnit::cm.GetConversionFactorFrom(FbxSystemUnit::m);
 
     // Fill it up with the raw model
-    WriteNodeHierarchy(raw, lScene);
+    Raw2FbxConverter converter(raw, lScene);
+    converter.WriteNodeHierarchy();
 
     // create an exporter.
     FbxExporter* lExporter = FbxExporter::Create(lSdkManager, "");
